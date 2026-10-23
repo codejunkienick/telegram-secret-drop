@@ -5,10 +5,13 @@ outside any git tree; values are placeholders like fake-value-123; the
 server binds 127.0.0.1 on a free port and no test reaches another host.
 """
 
+import base64
+import hashlib
 import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -37,9 +40,11 @@ EXPECTED_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": "default-src 'none';"
                                " style-src 'unsafe-inline';"
+                               " script-src 'sha256-%s';"
                                " form-action 'self';"
                                " frame-ancestors 'none';"
-                               " base-uri 'none'",
+                               " base-uri 'none'"
+                               % secret_drop._EYE_SCRIPT_HASH,
 }
 
 
@@ -167,12 +172,87 @@ class FormTest(ServerCase):
         self.assertIn('name="value"', text)
         self.assertIn('autocomplete="off"', text)
         self.assertIn('autocapitalize="off"', text)
+        self.assertIn('autocorrect="off"', text)
         self.assertIn('spellcheck="false"', text)
         self.assertIn("required", text)
         self.assertIn(">Store<", text)
+        self.assertIn("Show value", text)
         self.assertNotIn(token, text)
         status, _headers, _data = self.request("GET", "/s/" + token)
         self.assertEqual(status, 200)
+
+    def test_form_phone_fields(self):
+        token = self.open_slot("web", "token")
+        proc = self.start_serve()
+        self.wait_serving(proc, "web")
+        status, _headers, data = self.request("GET", "/s/" + token)
+        self.assertEqual(status, 200)
+        text = data.decode("utf-8")
+        self.assertIn(
+            '<meta name="viewport"'
+            ' content="width=device-width, initial-scale=1">', text)
+        found = re.findall(r"<input\b[^>]*>", text)
+        self.assertEqual(len(found), 1)
+        masked = found[0]
+        self.assertIn('type="password"', masked)
+        self.assertIn('name="value"', masked)
+        self.assertIn("required", masked)
+        for attr in ('autocomplete="off"', 'autocapitalize="off"',
+                     'autocorrect="off"', 'spellcheck="false"'):
+            self.assertIn(attr, masked)
+        found = re.findall(r"<textarea\b[^>]*>", text)
+        self.assertEqual(len(found), 1)
+        plain = found[0]
+        self.assertNotIn("name=", plain)
+        self.assertIn("hidden", plain)
+        match = re.search(r'rows="(\d+)"', plain)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(int(match.group(1)), 6)
+        for attr in ('autocomplete="off"', 'autocapitalize="off"',
+                     'autocorrect="off"', 'spellcheck="false"'):
+            self.assertIn(attr, plain)
+        style = re.sub(r"\s+", "", text)
+        for rule in ("width:100%", "font-family:monospace",
+                     "font-size:16px", "overflow-wrap:anywhere"):
+            self.assertIn(rule, style)
+        found = re.findall(r"<button\b[^>]*>", text)
+        eye = [tag for tag in found if 'id="secret-eye"' in tag]
+        self.assertEqual(len(eye), 1)
+        self.assertIn("hidden", eye[0])
+        self.assertIn('aria-pressed="false"', eye[0])
+        self.assertIn('id="secret-eye-label">Show value</span>', text)
+
+    def test_form_script_hash_matches_csp(self):
+        token = self.open_slot("web", "token")
+        proc = self.start_serve()
+        self.wait_serving(proc, "web")
+        status, headers, data = self.request("GET", "/s/" + token)
+        self.assertEqual(status, 200)
+        text = data.decode("utf-8")
+        self.assertEqual(text.count("<script"), 1)
+        self.assertEqual(text.count("</script>"), 1)
+        script = text.split("<script>", 1)[1].split("</script>", 1)[0]
+        digest = base64.b64encode(
+            hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+        csp = headers.get("Content-Security-Policy")
+        self.assertIn("script-src 'sha256-%s'" % digest, csp)
+        self.assertIn("default-src 'none'", csp)
+        self.assertIn("form-action 'self'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertIn("base-uri 'none'", csp)
+        directives = [part.strip() for part in csp.split(";")]
+        script_src = [part for part in directives
+                      if part.startswith("script-src")]
+        self.assertEqual(len(script_src), 1)
+        self.assertNotIn("'unsafe-inline'", script_src[0])
+        self.assertNotIn("'unsafe-eval'", script_src[0])
+        self.assertNotIn("://", text)
+        self.assertNotIn("url(", text)
+        for snippet in ('getElementById("secret-plain")',
+                        'removeAttribute("name")',
+                        'setAttribute("name", "value")',
+                        '"Hide value"', '"Show value"'):
+            self.assertIn(snippet, script)
 
     def test_routing_404s(self):
         token = self.open_slot("web", "token")
@@ -287,6 +367,7 @@ class FormTest(ServerCase):
         self.wait_serving(proc, "web")
         bodies = [
             b"value=",
+            b"value=%0D%0A",
             urllib.parse.urlencode({"value": "   "}).encode("ascii"),
             urllib.parse.urlencode({"value": "\t"}).encode("ascii"),
             urllib.parse.urlencode({"value": "a\tb"}).encode("ascii"),
@@ -347,6 +428,20 @@ class StoreTest(ServerCase):
         self.assertNotIn("fake-value-123", logged)
         self.assertIn("POST /s/... 200", logged)
         self.assertIn("stored first (14 bytes)", logged)
+
+    def test_value_at_size_limit_stores(self):
+        token = self.open_slot("web", "token")
+        proc = self.start_serve()
+        self.wait_serving(proc, "web")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        body = urllib.parse.urlencode(
+            {"value": "a" * 16384}).encode("ascii")
+        status, _headers, _data = self.request(
+            "POST", "/s/" + token, body=body, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(Path(self.target("token")).read_bytes(),
+                         b"a" * 16384)
+        self.assertEqual(proc.wait(timeout=10), 0)
 
     def test_slow_client_does_not_hold_server(self):
         token = self.open_slot("web", "token")
@@ -822,6 +917,203 @@ class HandshakeFileTest(ServerCase):
         self.assertTrue(called)
         self.assertEqual(code, 0)
         self.assertFalse((Path(self.slots) / "server.json").exists())
+
+
+_EYE_HARNESS_JS = """\"use strict\";
+const fs = require("fs");
+const path = require("path");
+const script = fs.readFileSync(
+    path.join(__dirname, "page.js"), "utf8");
+
+function makeEl(id) {
+  const listeners = {};
+  return {
+    id: id,
+    value: "",
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    required: false,
+    selectionStart: 0,
+    selectionEnd: 0,
+    attrs: {},
+    getAttribute: function (k) {
+      if (Object.prototype.hasOwnProperty.call(this.attrs, k)) {
+        return this.attrs[k];
+      }
+      return null;
+    },
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    removeAttribute: function (k) { delete this.attrs[k]; },
+    addEventListener: function (t, f) {
+      listeners[t] = listeners[t] || [];
+      listeners[t].push(f);
+    },
+    dispatch: function (t) {
+      const handlers = listeners[t] || [];
+      for (const f of handlers) { f({}); }
+    },
+    setSelectionRange: function (a, b) {
+      this.selectionStart = a;
+      this.selectionEnd = b;
+    },
+    focus: function () {},
+  };
+}
+
+const pass = makeEl("secret-value");
+pass.attrs.name = "value";
+pass.required = true;
+const plain = makeEl("secret-plain");
+plain.hidden = true;
+plain.disabled = true;
+const eye = makeEl("secret-eye");
+eye.hidden = true;
+eye.attrs["aria-pressed"] = "false";
+const eyeLabel = makeEl("secret-eye-label");
+eyeLabel.textContent = "Show value";
+const label = makeEl("secret-label");
+label.attrs.for = "secret-value";
+
+const document = {
+  getElementById: function (id) {
+    if (id === "secret-value") { return pass; }
+    if (id === "secret-plain") { return plain; }
+    if (id === "secret-eye") { return eye; }
+    if (id === "secret-eye-label") { return eyeLabel; }
+    if (id === "secret-label") { return label; }
+    throw new Error("unknown id " + id);
+  },
+};
+
+new Function("document", script)(document);
+
+function named() {
+  const found = [];
+  const controls = [pass, plain];
+  for (const el of controls) {
+    if (el.getAttribute("name") === "value") { found.push(el); }
+  }
+  return found;
+}
+function check(desc, cond, extra) {
+  if (!cond) {
+    console.log("not ok " + desc + (extra ? " :: " + extra : ""));
+    process.exitCode = 1;
+  } else {
+    console.log("ok " + desc);
+  }
+}
+function submitValue() {
+  const found = named();
+  check("exactly one named control", found.length === 1,
+        "found " + found.length);
+  if (found.length === 1) { return found[0].value; }
+  return null;
+}
+function onlyOneNamed(expected) {
+  const found = named();
+  check("exactly one named control", found.length === 1,
+        "found " + found.length);
+  if (found.length === 1) {
+    check("named control is " + expected.id, found[0] === expected,
+          found[0].id);
+    const other = expected === pass ? plain : pass;
+    check("other control has no name",
+          other.getAttribute("name") === null, other.id);
+  }
+}
+
+onlyOneNamed(pass);
+pass.value = "abc";
+onlyOneNamed(pass);
+let sent = submitValue();
+check("masked submit sends typed value", sent === "abc",
+      JSON.stringify(sent));
+check("textarea unnamed while masked",
+      plain.getAttribute("name") === null);
+
+eye.dispatch("click");
+onlyOneNamed(plain);
+check("revealed textarea shows value", plain.value === "abc",
+      JSON.stringify(plain.value));
+check("revealed textarea is the named one",
+      plain.getAttribute("name") === "value" &&
+      pass.getAttribute("name") === null);
+check("revealing sets pressed and label",
+      eye.getAttribute("aria-pressed") === "true" &&
+      eyeLabel.textContent === "Hide value");
+eye.dispatch("click");
+onlyOneNamed(pass);
+check("hidden password keeps value and name",
+      pass.value === "abc" && pass.getAttribute("name") === "value");
+check("hiding resets pressed and label",
+      eye.getAttribute("aria-pressed") === "false" &&
+      eyeLabel.textContent === "Show value");
+
+eye.dispatch("click");
+onlyOneNamed(plain);
+plain.value = "abcX";
+plain.selectionStart = 4;
+plain.selectionEnd = 4;
+plain.dispatch("input");
+eye.dispatch("click");
+onlyOneNamed(pass);
+pass.value = "abcXY";
+for (let i = 0; i < 5; i++) {
+  eye.dispatch("click");
+  onlyOneNamed(i % 2 === 0 ? plain : pass);
+}
+onlyOneNamed(plain);
+sent = submitValue();
+check("value survives repeated toggles", sent === "abcXY",
+      JSON.stringify(sent));
+
+if (plain.getAttribute("name") !== "value") { eye.dispatch("click"); }
+plain.value = "ab\\r\\ncd\\n";
+plain.selectionStart = 7;
+plain.selectionEnd = 7;
+plain.dispatch("input");
+onlyOneNamed(plain);
+check("line breaks stripped", plain.value === "abcd",
+      JSON.stringify(plain.value));
+
+plain.value = "shown-secret";
+plain.dispatch("input");
+onlyOneNamed(plain);
+sent = submitValue();
+check("revealed submit sends textarea value",
+      sent === "shown-secret", JSON.stringify(sent));
+check("password unnamed while revealed",
+      pass.getAttribute("name") === null);
+
+if (process.exitCode) {
+  console.log("FAILURES PRESENT");
+} else {
+  console.log("ALL PASS");
+}
+"""
+
+
+class ScriptTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "node is not on PATH")
+    def test_eye_script_swaps_named_value(self):
+        record = {"name": "web", "reason": "r", "target": "/tmp/x",
+                  "expires_at": int(time.time()) + 600}
+        text = secret_drop._form_page(record)
+        script = text.split("<script>", 1)[1].split("</script>", 1)[0]
+        with tempfile.TemporaryDirectory(prefix="sd-eye-") as tmp:
+            page_path = os.path.join(tmp, "page.js")
+            harness_path = os.path.join(tmp, "harness.js")
+            with open(page_path, "w", encoding="utf-8") as handle:
+                handle.write(script)
+            with open(harness_path, "w", encoding="utf-8") as handle:
+                handle.write(_EYE_HARNESS_JS)
+            proc = subprocess.run(
+                ["node", harness_path], capture_output=True, text=True,
+                timeout=60, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ALL PASS", proc.stdout)
 
 
 if __name__ == "__main__":

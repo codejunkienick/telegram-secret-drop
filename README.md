@@ -83,7 +83,7 @@ The agent side has four commands. Each prints one JSON line.
 
 Values are one line. Control characters are refused, so a multi-line value cannot be stored. The value is stripped of surrounding whitespace, must be 1 to 16384 bytes, and is stored without a trailing newline. Names match [a-z0-9][a-z0-9._-]{0,63} and cannot be "server". Reasons are printable and at most 200 characters. Target paths and allowed_dirs use only letters, digits and . _ @ + / -. A file name with a space is refused as target_bad_path. The form answers a rejected value with only "The value was not accepted. Try again.".
 
-What the user sees: a link in the paired chat that works once and expires. The link opens a form showing the slot name, the reason, the file and the expiry time. After storing, the page says the value was stored and the page can be closed. A value the form rejects shows a retry line. A value that cannot be stored shows Not stored, and the agent must open a new link. A link that is used, expired or unknown shows a not found page.
+What the user sees: a link in the paired chat that works once and expires. The link opens a form showing the slot name, the reason, the file and the expiry time. The value field is masked and sized for phones; an eye button shows the value in a larger wrapping box and hides it again. After storing, the page says the value was stored and the page can be closed. A value the form rejects shows a retry line. A value that cannot be stored shows Not stored, and the agent must open a new link. A link that is used, expired or unknown shows a not found page.
 
 ## how it works
 

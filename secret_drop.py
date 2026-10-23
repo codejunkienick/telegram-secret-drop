@@ -6,6 +6,7 @@ learns only whether it was stored and its length.
 """
 
 import argparse
+import base64
 import datetime
 import errno
 import fcntl
@@ -827,13 +828,97 @@ _VALUE_REFUSED_LINE = "The value was not accepted. Try again."
 _TOKEN_PATH_RE = re.compile(r"/s/([A-Za-z0-9_-]{43})")
 _SAFE_METHOD_RE = re.compile(r"[A-Za-z]{1,16}")
 
+_TOGGLE_SCRIPT = """(function () {
+var pass = document.getElementById("secret-value");
+var plain = document.getElementById("secret-plain");
+var eye = document.getElementById("secret-eye");
+var eyeLabel = document.getElementById("secret-eye-label");
+var label = document.getElementById("secret-label");
+function stripBreaks(text) {
+var out = "";
+for (var i = 0; i < text.length; i++) {
+var c = text[i];
+if (c !== "\\r" && c !== "\\n") {
+out = out + c;
+}
+}
+return out;
+}
+plain.addEventListener("input", function () {
+var value = plain.value;
+var start = plain.selectionStart;
+var end = plain.selectionEnd;
+var clean = "";
+var dropBeforeStart = 0;
+var dropBeforeEnd = 0;
+for (var i = 0; i < value.length; i++) {
+var c = value[i];
+if (c === "\\r" || c === "\\n") {
+if (i < start) {
+dropBeforeStart = dropBeforeStart + 1;
+}
+if (i < end) {
+dropBeforeEnd = dropBeforeEnd + 1;
+}
+} else {
+clean = clean + c;
+}
+}
+if (clean.length === value.length) {
+return;
+}
+plain.value = clean;
+try {
+plain.setSelectionRange(start - dropBeforeStart,
+end - dropBeforeEnd);
+} catch (err) {}
+});
+eye.addEventListener("click", function () {
+if (plain.hidden) {
+plain.value = stripBreaks(pass.value);
+pass.removeAttribute("name");
+pass.disabled = true;
+pass.hidden = true;
+pass.required = false;
+plain.setAttribute("name", "value");
+plain.disabled = false;
+plain.hidden = false;
+plain.required = true;
+label.setAttribute("for", "secret-plain");
+eyeLabel.textContent = "Hide value";
+eye.setAttribute("aria-pressed", "true");
+plain.focus();
+} else {
+pass.value = plain.value;
+plain.removeAttribute("name");
+plain.disabled = true;
+plain.hidden = true;
+plain.required = false;
+pass.setAttribute("name", "value");
+pass.disabled = false;
+pass.hidden = false;
+pass.required = true;
+label.setAttribute("for", "secret-value");
+eyeLabel.textContent = "Show value";
+eye.setAttribute("aria-pressed", "false");
+pass.focus();
+}
+});
+eye.hidden = false;
+}());"""
+
+_EYE_SCRIPT_HASH = base64.b64encode(
+    hashlib.sha256(_TOGGLE_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+
 _SECURITY_HEADERS = (
     ("Content-Type", "text/html; charset=utf-8"),
     ("Cache-Control", "no-store"),
     ("Referrer-Policy", "same-origin"),
     ("X-Content-Type-Options", "nosniff"),
     ("Content-Security-Policy", "default-src 'none';"
-     " style-src 'unsafe-inline'; form-action 'self';"
+     " style-src 'unsafe-inline';"
+     " script-src 'sha256-" + _EYE_SCRIPT_HASH + "';"
+     " form-action 'self';"
      " frame-ancestors 'none'; base-uri 'none'"),
 )
 
@@ -977,9 +1062,22 @@ def _form_page(record, error=None):
         "<html>",
         "<head>",
         '<meta charset="utf-8">',
+        '<meta name="viewport"'
+        ' content="width=device-width, initial-scale=1">',
         "<title>secret-drop</title>",
+        "<style>",
+        "body{font-family:sans-serif;margin:0;padding:16px;color:#111}",
+        "main{max-width:34rem;margin:0 auto}",
+        ".row{margin:12px 0}",
+        "label{display:block;margin:0 0 4px}",
+        "input,textarea{width:100%;box-sizing:border-box;"
+        "font-family:monospace;font-size:16px}",
+        "textarea{overflow-wrap:anywhere}",
+        "button{font-size:16px}",
+        "</style>",
         "</head>",
         "<body>",
+        "<main>",
         "<h1>Store a secret</h1>",
         "<p>Slot: %s</p>" % html.escape(record["name"]),
         "<p>Reason: %s</p>" % html.escape(record["reason"]),
@@ -990,12 +1088,26 @@ def _form_page(record, error=None):
     if error is not None:
         rows.append("<p>%s</p>" % error)
     rows += [
-        '<form method="post">',
-        '<label>Value <input type="password" name="value"'
-        ' autocomplete="off" autocapitalize="off" spellcheck="false"'
-        " required></label>",
-        '<button type="submit">Store</button>',
+        '<form method="post" id="secret-form">',
+        '<div class="row"><label id="secret-label"'
+        ' for="secret-value">Value</label>',
+        '<input type="password" id="secret-value" name="value"'
+        ' autocomplete="off" autocapitalize="off" autocorrect="off"'
+        ' spellcheck="false" required>',
+        '<textarea id="secret-plain" rows="8"'
+        ' autocomplete="off" autocapitalize="off" autocorrect="off"'
+        ' spellcheck="false" hidden disabled></textarea></div>',
+        '<div class="row"><button type="button" id="secret-eye"'
+        ' aria-pressed="false" hidden>'
+        '<svg viewBox="0 0 24 24" width="16" height="16"'
+        ' aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6'
+        ' -10-6-10-6Z" fill="none" stroke="currentColor" stroke-width="2"/>'
+        '<circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>'
+        ' <span id="secret-eye-label">Show value</span></button>',
+        '<button type="submit">Store</button></div>',
         "</form>",
+        "</main>",
+        "<script>" + _TOGGLE_SCRIPT + "</script>",
         "</body>",
         "</html>",
     ]
