@@ -96,6 +96,9 @@ def main():
         handle.write(" ".join(args) + "\\n")
     body = args[args.index("--body-file") + 1]
     shutil.copyfile(body, os.environ["SD_TEST_SEND_CAPTURE"])
+    if os.environ.get("SD_TEST_SEND_BLOCK") == "1":
+        time.sleep(60)
+        return 0
     if os.environ.get("SD_TEST_SEND_FORK") == "1":
         if os.fork() == 0:
             time.sleep(30)
@@ -468,26 +471,36 @@ class OpenCase(unittest.TestCase):
         self.assertEqual(left, [])
 
     def test_send_error_cleans_body_file(self):
-        for suffix, error in (("a", OSError("boom")),
-                              ("b", KeyboardInterrupt())):
-            with self.subTest(send=suffix):
-                name = "page-" + suffix
-                with unittest.mock.patch.object(
-                        secret_drop, "_wait_served",
-                        return_value=True), \
-                     unittest.mock.patch.object(
-                        secret_drop, "_run_send",
-                        side_effect=error):
-                    code, out, err = self.open_in_process(name=name)
-                self.assertEqual(code, 1)
-                self.assertEqual(
-                    err, "secret-drop: send_failed (exit error)\n")
-                self.assertEqual(out, "")
-                self.assertEqual(self.read_record(name)["state"],
-                                 "cancelled")
-                left = [entry for entry in os.listdir(self.slots)
-                        if entry.startswith("send-")]
-                self.assertEqual(left, [])
+        with unittest.mock.patch.object(
+                secret_drop, "_wait_served",
+                return_value=True), \
+             unittest.mock.patch.object(
+                secret_drop, "_run_send",
+                side_effect=OSError("boom")):
+            code, out, err = self.open_in_process()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            err, "secret-drop: send_failed (exit error)\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"],
+                         "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, [])
+
+    def test_send_interrupt_reports_interrupted(self):
+        with unittest.mock.patch.object(secret_drop, "_wait_served",
+                                        return_value=True), \
+             unittest.mock.patch.object(secret_drop, "_run_send",
+                                        side_effect=KeyboardInterrupt()):
+            code, out, err = self.open_in_process()
+        self.assertEqual(code, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, [])
 
     def test_unproven_removal_cancels_slot(self):
         # A 000 slots dir breaks removal and the cancel alike, so this
@@ -580,11 +593,84 @@ class OpenCase(unittest.TestCase):
              unittest.mock.patch.object(secret_drop.os, "unlink",
                                         side_effect=KeyboardInterrupt()):
             code, out, err = self.open_in_process()
+        self.assertEqual(code, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+
+    def test_cleanup_first_unlink_interrupt_reports_interrupted(self):
+        calls = []
+        real_unlink = os.unlink
+
+        def flaky_unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).startswith("send-"):
+                calls.append(path)
+                if len(calls) == 1:
+                    raise KeyboardInterrupt()
+            return real_unlink(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(secret_drop, "_wait_served",
+                                        return_value=True), \
+             unittest.mock.patch.object(secret_drop, "_run_send",
+                                        return_value=(True, None, None)), \
+             unittest.mock.patch.object(secret_drop.os, "unlink",
+                                        side_effect=flaky_unlink):
+            code, out, err = self.open_in_process()
+        self.assertEqual(code, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, [])
+
+    def test_cleanup_lstat_interrupt_reports_interrupted(self):
+        real_lstat = os.lstat
+
+        def flaky_lstat(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).startswith("send-"):
+                raise KeyboardInterrupt()
+            return real_lstat(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(secret_drop, "_wait_served",
+                                        return_value=True), \
+             unittest.mock.patch.object(secret_drop, "_run_send",
+                                        return_value=(True, None, None)), \
+             unittest.mock.patch.object(secret_drop.os, "lstat",
+                                        side_effect=flaky_lstat):
+            code, out, err = self.open_in_process()
+        self.assertEqual(code, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, [])
+
+    def test_cleanup_oserror_keeps_exit_cleanup(self):
+        real_unlink = os.unlink
+
+        def fail_unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).startswith("send-"):
+                raise OSError("denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(secret_drop, "_wait_served",
+                                        return_value=True), \
+             unittest.mock.patch.object(secret_drop, "_run_send",
+                                        return_value=(True, None, None)), \
+             unittest.mock.patch.object(secret_drop.os, "unlink",
+                                        side_effect=fail_unlink):
+            code, out, err = self.open_in_process()
         self.assertEqual(code, 1)
         self.assertEqual(err,
                          "secret-drop: send_failed (exit cleanup)\n")
         self.assertEqual(out, "")
-        self.assertEqual(self.read_record("page")["state"], "cancelled")
+        record = self.read_record("page")
+        self.assertEqual(record["state"], "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, ["send-%s.html" % record["slot_id"]])
 
     def test_late_handshake_never_sends(self):
         ticks = iter([100.0, 101.0, 101.0, 106.0])
@@ -627,19 +713,21 @@ class OpenCase(unittest.TestCase):
                      unittest.mock.patch.object(
                         secret_drop.os, "killpg") as killpg:
                     code, out, err = self.open_in_process(name=name)
-                self.assertEqual(code, 1)
-                self.assertEqual(
-                    err, "secret-drop: send_failed (exit error)\n")
+                if suffix == "b":
+                    self.assertEqual(code, 130)
+                    self.assertEqual(err, "secret-drop: interrupted\n")
+                    killpg.assert_called_once_with(12345, signal.SIGKILL)
+                else:
+                    self.assertEqual(code, 1)
+                    self.assertEqual(
+                        err, "secret-drop: send_failed (exit error)\n")
+                    killpg.assert_not_called()
                 self.assertEqual(out, "")
                 self.assertEqual(self.read_record(name)["state"],
                                  "cancelled")
                 left = [entry for entry in os.listdir(self.slots)
                         if entry.startswith("send-")]
                 self.assertEqual(left, [])
-                if suffix == "b":
-                    killpg.assert_called_once_with(12345, signal.SIGKILL)
-                else:
-                    killpg.assert_not_called()
 
     def test_interrupted_open_cancels_slot(self):
         env = self.make_env(SD_TEST_SYSTEMCTL_NOOP="1")
@@ -662,6 +750,42 @@ class OpenCase(unittest.TestCase):
         self.assertEqual(err, "secret-drop: interrupted\n")
         self.assertEqual(out, "")
         self.assertEqual(self.read_record("page")["state"], "cancelled")
+
+    def test_send_ctrl_c_interrupts_open(self):
+        env = self.make_env(SD_TEST_SEND_BLOCK="1")
+        proc = subprocess.Popen(
+            [sys.executable, "-B", SECRET_DROP, "--settings",
+             self.settings_path, "open", "--name", "page",
+             "--file", self.target("token"),
+             "--reason", "rotation"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(self.tmp), env=env)
+        log = Path(env["SD_TEST_SEND_LOG"])
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                if log.stat().st_size > 0:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        else:
+            proc.kill()
+            self.fail("send did not start before SIGINT")
+        proc.send_signal(signal.SIGINT)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate(timeout=30)
+            self.fail("open did not exit after SIGINT")
+        self.assertEqual(proc.returncode, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+        left = [entry for entry in os.listdir(self.slots)
+                if entry.startswith("send-")]
+        self.assertEqual(left, [])
 
 
 if __name__ == "__main__":

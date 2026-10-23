@@ -228,8 +228,12 @@ def _load_unit(data):
 def load_settings(path=None):
     """Read and check the settings file; refuse with SettingsError."""
     if path is None:
-        path = (os.environ.get("SECRET_DROP_SETTINGS")
-                or os.path.expanduser("~/.config/secret-drop/settings.toml"))
+        path = os.environ.get("SECRET_DROP_SETTINGS")
+        if not path:
+            raise SettingsError(
+                "settings: settings_required "
+                "(set SECRET_DROP_SETTINGS or pass --settings "
+                "before the command)")
     settings_path = path if os.path.isabs(path) else os.path.abspath(path)
     fd = _settings_file_open(path)
     try:
@@ -1552,6 +1556,10 @@ def _send_link(settings, record, link, token):
 
     Return (True, None, None) on success, else (False, kind, err) with
     kind "exit cleanup", "exit error" or the send's "exit N" reason.
+    A KeyboardInterrupt still runs the body-file cleanup below and then
+    propagates, so the caller reports it as interrupted. An interrupt
+    that lands during the cleanup itself is retried once and then
+    propagates the same way.
     """
     name = "send-%s.html" % record["slot_id"]
     try:
@@ -1568,6 +1576,7 @@ def _send_link(settings, record, link, token):
         except OSError:
             return (False, "exit body", None)
         outcome = (False, "exit error", None)
+        interrupted = False
         try:
             try:
                 os.fchmod(body_fd, 0o600)
@@ -1582,8 +1591,6 @@ def _send_link(settings, record, link, token):
             outcome = _run_send(settings,
                                 os.path.join(settings.slots_dir, name),
                                 record["slot_id"])
-        except KeyboardInterrupt:
-            outcome = (False, "exit error", None)
         except Exception:
             outcome = (False, "exit error", None)
         finally:
@@ -1592,17 +1599,31 @@ def _send_link(settings, record, link, token):
                     os.unlink(name, dir_fd=dir_fd)
                 except FileNotFoundError:
                     proven = True
+                except KeyboardInterrupt:
+                    interrupted = True
+                    proven = False
                 else:
                     try:
                         os.lstat(name, dir_fd=dir_fd)
                     except FileNotFoundError:
                         proven = True
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        proven = False
                     except OSError:
                         proven = False
                     else:
                         proven = False
             except BaseException:
                 proven = False
+            if interrupted:
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+                except BaseException:
+                    pass
+                raise KeyboardInterrupt
         if not proven:
             return (False, "exit cleanup", None)
         return outcome
@@ -1709,8 +1730,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Take in one secret without ever seeing it.")
     parser.add_argument("--settings", default=None,
-                        help="settings file (else $SECRET_DROP_SETTINGS,"
-                        " else ~/.config/secret-drop/settings.toml)")
+                        help="settings file (else $SECRET_DROP_SETTINGS)")
     sub = parser.add_subparsers(dest="subcommand", required=True)
     check = sub.add_parser("check", help="check the settings file")
     check.set_defaults(run=_check_command)

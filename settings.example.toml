@@ -1,5 +1,7 @@
-# Example settings for secret-drop: copy to ~/.config/secret-drop/settings.toml
-# and chmod 600 so only the owner can read it.
+# Example settings for secret-drop: copy these anywhere sensible, for
+# example ~/.config/secret-drop/settings.toml, and chmod 600 so only
+# the owner can read it. Each command reads its settings from --settings
+# or $SECRET_DROP_SETTINGS and refuses without one of them.
 # Address of the LAN interface the phone-facing server binds to.
 lan_address = "192.168.1.20"
 # TCP port the phone-facing server listens on.

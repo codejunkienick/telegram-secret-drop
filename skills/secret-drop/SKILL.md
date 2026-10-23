@@ -11,6 +11,8 @@ The user gets a one-time link in the paired chat. The link works once and expire
 
 Exit 0 means stored. Exit 3 means finished without a value. Exit 4 means still open.
 
+The gc secret commands read their settings from $SECRET_DROP_SETTINGS, which the install sets in the environment the agents run in. They refuse without it. Never guess or pass a settings path.
+
 Never read, print, copy, hash, grep or cat the target. Hand the consuming program the path instead. Point it at the file with its key-file option, or give it an environment file it reads itself.
 
 On expired, ask once whether to open a new link. With --replace, open replaces an open slot of the same name. With --overwrite, the value replaces an existing file.

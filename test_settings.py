@@ -43,6 +43,9 @@ SYMLINK_MESSAGE = "settings: allowed_dirs must not contain a symlink"
 EXIST_MESSAGE = ("settings: allowed_dirs must be existing directories"
                    " you own that group and others cannot write")
 UNIT_MESSAGE = "settings: unit must be a name ending in .service"
+REQUIRED_MESSAGE = ("settings: settings_required "
+                    "(set SECRET_DROP_SETTINGS or pass --settings "
+                    "before the command)")
 
 MARKER = "FAKE-MARKER-7QZ-no-secret"
 
@@ -352,6 +355,139 @@ class LoadRefusalTest(TempCase):
                 allowed_dirs=[self.allowed_str + "/" + MARKER + " bad"]))
         self.assertEqual(str(ctx.exception), CHARSET_MESSAGE)
         self.assertNotIn(MARKER, str(ctx.exception))
+
+
+class SettingsSourceTest(TempCase):
+    def run_cli(self, *args, **env_overrides):
+        env = dict(os.environ)
+        env.pop("SECRET_DROP_SETTINGS", None)
+        env.update(env_overrides)
+        return subprocess.run(
+            [sys.executable, SECRET_DROP, *args],
+            cwd=str(self.tmp), capture_output=True, text=True, timeout=60,
+            env=env)
+
+    def make_home_settings(self):
+        home = self.tmp / "home"
+        config = home / ".config" / "secret-drop"
+        config.mkdir(parents=True, mode=0o700)
+        allowed = home / "allowed"
+        allowed.mkdir(mode=0o700)
+        slots = home / "slots"
+        text = "".join("%s = %s\n" % (key, _toml(value))
+                       for key, value in {
+                           "lan_address": "127.0.0.1",
+                           "port": 18001,
+                           "allowed_dirs": [str(allowed)],
+                           "slots_dir": str(slots),
+                       }.items())
+        path = config / "settings.toml"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            data = text.encode("utf-8")
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        finally:
+            os.close(fd)
+        return home, slots
+
+    def test_commands_refuse_without_settings_source(self):
+        home, slots = self.make_home_settings()
+        target = str(self.tmp / "token")
+        cases = (
+            ("open", "--name", "page", "--file", target,
+             "--reason", "rotation"),
+            ("status", "page"),
+            ("cancel", "page"),
+            ("list",),
+        )
+        for argv in cases:
+            with self.subTest(command=argv[0]):
+                proc = self.run_cli(*argv, HOME=str(home))
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(
+                    proc.stderr, "secret-drop: %s\n" % REQUIRED_MESSAGE)
+                self.assertEqual(proc.stdout, "")
+        self.assertFalse(slots.exists())
+
+    def test_default_path_file_is_never_read(self):
+        home = self.tmp / "home"
+        config = home / ".config" / "secret-drop"
+        config.mkdir(parents=True, mode=0o700)
+        path = config / "settings.toml"
+        path.write_bytes(b"lan_address = broken")
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        env = dict(os.environ)
+        env.pop("SECRET_DROP_SETTINGS", None)
+        env["HOME"] = str(home)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SettingsError) as ctx:
+                load_settings(None)
+        self.assertEqual(str(ctx.exception), REQUIRED_MESSAGE)
+
+    def test_empty_env_var_refuses(self):
+        home, _slots = self.make_home_settings()
+        env = dict(os.environ)
+        env.pop("SECRET_DROP_SETTINGS", None)
+        env["SECRET_DROP_SETTINGS"] = ""
+        env["HOME"] = str(home)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SettingsError) as ctx:
+                load_settings(None)
+        self.assertEqual(str(ctx.exception), REQUIRED_MESSAGE)
+
+    def test_env_var_selects_file_at_cli(self):
+        path = self.write_settings(self.base_values())
+        proc = self.run_cli("check", SECRET_DROP_SETTINGS=path)
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue(proc.stdout.startswith("settings ok\n"))
+        self.assertEqual(proc.stderr, "")
+
+    def test_explicit_settings_wins_over_env(self):
+        first = self.write_settings(
+            self.base_values(slots_dir=str(self.tmp / "slots-a")),
+            name="a.toml")
+        second = self.write_settings(
+            self.base_values(slots_dir=str(self.tmp / "slots-b")),
+            name="b.toml")
+        proc = self.run_cli("--settings", second, "check",
+                            SECRET_DROP_SETTINGS=first)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("slots_dir=%s\n" % str(self.tmp / "slots-b"),
+                      proc.stdout)
+        self.assertNotIn(str(self.tmp / "slots-a"), proc.stdout)
+        self.assertEqual(proc.stderr, "")
+
+    def test_list_wrapper_reads_settings_from_env(self):
+        slots = self.tmp / "slots"
+        slots.mkdir(mode=0o700)
+        path = self.write_settings(
+            self.base_values(slots_dir=str(slots)))
+        home = self.tmp / "home"
+        home.mkdir(mode=0o700)
+        run = str(ROOT / "commands" / "list" / "run.sh")
+        env = dict(os.environ)
+        env.pop("SECRET_DROP_SETTINGS", None)
+        env["HOME"] = str(home)
+        env["SECRET_DROP_SETTINGS"] = path
+        proc = subprocess.run(
+            ["sh", run], cwd=str(self.tmp), capture_output=True,
+            text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "[]\n")
+        self.assertEqual(proc.stderr, "")
+        del env["SECRET_DROP_SETTINGS"]
+        proc = subprocess.run(
+            ["sh", run], cwd=str(self.tmp), capture_output=True,
+            text=True, timeout=60, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(
+            proc.stderr, "secret-drop: %s\n" % REQUIRED_MESSAGE)
+        self.assertEqual(proc.stdout, "")
 
 
 class CheckTargetTest(TempCase):

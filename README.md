@@ -30,6 +30,8 @@ chmod 600 ~/.config/secret-drop/settings.toml
 
 Edit the file. Set `lan_address` to the address of the LAN interface the phone can reach, for example `192.168.1.20`. Set `port`, for example `8765`. Set `allowed_dirs` to the directories a secret may be written under. Each one must exist, be owned by the user, and not be writable by group or others. Set `python` to an interpreter outside any home directory. `check`, `render-unit` and `install.sh` refuse a python under `/home`, `/root` or `$HOME`.
 
+`secret_drop.py` takes `--settings` before the subcommand (for example `secret_drop.py --settings FILE check`), else `$SECRET_DROP_SETTINGS`, and refuses without one. The `gc secret` commands take no `--settings`, so set `SECRET_DROP_SETTINGS` in the environment the city agents run in. The copy location above is only a suggestion. On a shared host this keeps one install from silently using another install's file.
+
 Check the settings, create the slots dir and write the unit:
 
 ```
