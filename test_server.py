@@ -23,6 +23,7 @@ from pathlib import Path
 
 import secret_drop
 from secret_drop import load_settings, new_slot
+from testports import free_port
 
 ROOT = Path(__file__).resolve().parent
 SECRET_DROP = str(ROOT / "secret_drop.py")
@@ -40,14 +41,6 @@ EXPECTED_SECURITY_HEADERS = {
                                " frame-ancestors 'none';"
                                " base-uri 'none'",
 }
-
-
-def _free_port():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def _toml(value):
@@ -69,7 +62,7 @@ class ServerCase(unittest.TestCase):
         self.tmp = Path(tmp.name)
         self.allowed = self.tmp / "allowed"
         self.allowed.mkdir(mode=0o700)
-        self.port = _free_port()
+        self.port = free_port()
         self.slots = str(self.tmp / "slots")
         values = {
             "lan_address": "127.0.0.1",

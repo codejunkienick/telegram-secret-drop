@@ -122,3 +122,5 @@ python3 -B -m unittest discover -s . -p 'test_*.py'
 ```
 
 The tests are offline and fake-only. They use temporary directories and example values.
+
+To run behind a loopback firewall, set TEST_PORT_RANGE to LOW-HIGH so test servers stay inside it, for example TEST_PORT_RANGE=9300-9399. Leave out ports the host services use: the drop listens only while a slot is open, so a test run could take its port first.

@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import stat
 import subprocess
 import sys
@@ -56,6 +55,7 @@ from secret_drop import (
     load_settings,
     new_slot,
 )
+from testports import free_port
 
 ROOT = Path(__file__).resolve().parent
 SECRET_DROP = str(ROOT / "secret_drop.py")
@@ -111,7 +111,7 @@ class SlotCase(unittest.TestCase):
     def base_values(self, **overrides):
         values = {
             "lan_address": "192.168.1.20",
-            "port": 18001,
+            "port": free_port(),
             "allowed_dirs": [self.allowed_str],
             "slots_dir": self.slots,
         }
@@ -404,10 +404,7 @@ class SubcommandTest(SlotCase):
                 hashlib.sha256(run.encode()).hexdigest(), token_sha256)
 
     def test_open_output_has_no_token(self):
-        sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
+        port = free_port()
         bindir = self.tmp / "bin"
         bindir.mkdir(mode=0o700)
         ctl = bindir / "systemctl"

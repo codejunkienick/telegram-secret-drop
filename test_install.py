@@ -7,13 +7,14 @@ real settings file, no systemctl, no network.
 import json
 import os
 import shutil
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from testports import free_port
 
 ROOT = Path(__file__).resolve().parent
 SECRET_DROP = str(ROOT / "secret_drop.py")
@@ -36,14 +37,6 @@ def main():
 
 sys.exit(main())
 """
-
-
-def _free_port():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def _toml(value):
@@ -71,7 +64,7 @@ class InstallCase(unittest.TestCase):
         self.allowed_one.mkdir(mode=0o700)
         self.allowed_two.mkdir(mode=0o700)
         self.slots = str(self.tmp / "slots")
-        self.port = _free_port()
+        self.port = free_port()
         self.bindir = self.tmp / "bin"
         self.bindir.mkdir(mode=0o700)
         (self.bindir / "systemctl").write_text(FAKE_SYSTEMCTL)
