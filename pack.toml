@@ -1,0 +1,5 @@
+# Secret drop: ask for a secret without seeing it, through the bridge.
+[pack]
+name = "secret"
+version = "0.1.0"
+schema = 2

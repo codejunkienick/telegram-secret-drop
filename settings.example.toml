@@ -1,0 +1,16 @@
+# Example settings for secret-drop: copy to ~/.config/secret-drop/settings.toml
+# and chmod 600 so only the owner can read it.
+# Address of the LAN interface the phone-facing server binds to.
+lan_address = "192.168.1.20"
+# TCP port the phone-facing server listens on.
+port = 8765
+# Directories a secret may be written under (owner-only, no symlinks).
+allowed_dirs = ["~/.config/example-app"]
+# Directory that holds the one-time slots; it is created on demand.
+# slots_dir = "~/.local/state/secret-drop"
+# Command used to send the one-time link through the bridge.
+# send_command = ["gc", "telegram", "reply-current"]
+# On-demand unit that serves the phone-facing form.
+# unit = "secret-drop.service"
+# Python interpreter the unit runs.
+# python = "/usr/bin/python3"
