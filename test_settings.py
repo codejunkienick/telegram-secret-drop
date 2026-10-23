@@ -6,6 +6,7 @@ the network or starts a unit.
 """
 
 import dataclasses
+import errno
 import json
 import os
 import re
@@ -39,7 +40,8 @@ ABS_MESSAGE = "settings: allowed_dirs must be absolute normalized paths"
 CHARSET_MESSAGE = ("settings: allowed_dirs must use only letters,"
                    " digits and . _ @ + / -")
 SYMLINK_MESSAGE = "settings: allowed_dirs must not contain a symlink"
-EXIST_MESSAGE = "settings: allowed_dirs must be existing owner-only directories"
+EXIST_MESSAGE = ("settings: allowed_dirs must be existing directories"
+                   " you own that group and others cannot write")
 UNIT_MESSAGE = "settings: unit must be a name ending in .service"
 
 MARKER = "FAKE-MARKER-7QZ-no-secret"
@@ -295,6 +297,20 @@ class LoadRefusalTest(TempCase):
         self.assertSettingsError(
             EXIST_MESSAGE, self.base_values(allowed_dirs=[str(plain)]))
 
+    def test_allowed_dirs_world_writable_wording(self):
+        ok_dir = self.tmp / "okdir"
+        ok_dir.mkdir(mode=0o700)
+        os.chmod(ok_dir, 0o755)
+        settings = load_settings(
+            self.write_settings(self.base_values(
+                allowed_dirs=[str(ok_dir)])))
+        self.assertEqual(settings.allowed_dirs, (str(ok_dir),))
+        bad_dir = self.tmp / "baddir"
+        bad_dir.mkdir(mode=0o700)
+        os.chmod(bad_dir, 0o775)
+        self.assertSettingsError(
+            EXIST_MESSAGE, self.base_values(allowed_dirs=[str(bad_dir)]))
+
     def test_unit_refusals(self):
         for unit in ("plain-name", "secret-drop.timer", 5):
             with self.subTest(unit=unit):
@@ -506,6 +522,74 @@ class WriteSecretTest(TempCase):
         with self.assertRaises(TypeError):
             write_secret(self.settings, str(self.allowed / "f"),
                          False, "fake-value-123")
+
+    def test_no_replace_race_keeps_existing(self):
+        path = str(self.allowed / "token")
+        Path(path).write_bytes(b"old-bytes")
+
+        def missing_lstat(*args, **kwargs):
+            raise FileNotFoundError(2, "missing")
+
+        with unittest.mock.patch.object(secret_drop.os, "lstat",
+                                        side_effect=missing_lstat):
+            self.assertTargetError("target_exists", write_secret,
+                                   self.settings, path, False,
+                                   b"fake-value-123")
+        self.assertEqual(Path(path).read_bytes(), b"old-bytes")
+        self.assertNoTempFiles(self.allowed)
+
+    def test_no_overwrite_leaves_no_temp_name(self):
+        target = str(self.allowed / "token")
+        real_open = secret_drop.os.open
+        seen = []
+
+        def spy_open(path, flags, *args, **kwargs):
+            seen.append((path, flags))
+            return real_open(path, flags, *args, **kwargs)
+
+        with unittest.mock.patch.object(secret_drop.os, "open",
+                                        side_effect=spy_open):
+            count = write_secret(self.settings, target, False,
+                                 b"fake-value-123")
+        self.assertEqual(count, 14)
+        self.assertEqual(Path(target).read_bytes(), b"fake-value-123")
+        self.assertEqual(sorted(os.listdir(self.allowed)), ["token"])
+        self.assertTrue(any(path == "."
+                            and (flags & os.O_TMPFILE) == os.O_TMPFILE
+                            for path, flags in seen))
+        with unittest.mock.patch.object(secret_drop.os, "open",
+                                        side_effect=spy_open):
+            self.assertTargetError("target_exists", write_secret,
+                                   self.settings, target, False,
+                                   b"fake-value-999")
+        self.assertEqual(Path(target).read_bytes(), b"fake-value-123")
+        self.assertEqual(sorted(os.listdir(self.allowed)), ["token"])
+
+    def test_fallback_unlink_failure_is_temp_left(self):
+        target = str(self.allowed / "token")
+        real_open = secret_drop.os.open
+        real_unlink = secret_drop.os.unlink
+
+        def refuse_tmpfile(path, flags, *args, **kwargs):
+            tmpfile = getattr(os, "O_TMPFILE", 0)
+            if tmpfile and (flags & tmpfile) == tmpfile:
+                raise OSError(errno.EOPNOTSUPP, "not supported")
+            return real_open(path, flags, *args, **kwargs)
+
+        def fail_temp_unlink(path, *args, **kwargs):
+            base = os.path.basename(os.fspath(path))
+            if base.startswith(".secret-drop-"):
+                raise OSError(errno.EPERM, "denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(secret_drop.os, "open",
+                                        side_effect=refuse_tmpfile), \
+             unittest.mock.patch.object(secret_drop.os, "unlink",
+                                        side_effect=fail_temp_unlink):
+            self.assertTargetError("target_temp_left", write_secret,
+                                   self.settings, target, False,
+                                   b"fake-value-123")
+        self.assertEqual(Path(target).read_bytes(), b"fake-value-123")
 
 
 class CheckCommandTest(TempCase):

@@ -649,6 +649,28 @@ class OpenCase(unittest.TestCase):
                 else:
                     killpg.assert_not_called()
 
+    def test_interrupted_open_cancels_slot(self):
+        env = self.make_env(SD_TEST_SYSTEMCTL_NOOP="1")
+        proc = subprocess.Popen(
+            [sys.executable, "-B", SECRET_DROP, "--settings",
+             self.settings_path, "open", "--name", "page",
+             "--file", self.target("token"),
+             "--reason", "rotation"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(self.tmp), env=env)
+        time.sleep(1.0)
+        proc.send_signal(signal.SIGINT)
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate(timeout=10)
+            self.fail("open did not exit after SIGINT")
+        self.assertEqual(proc.returncode, 130)
+        self.assertEqual(err, "secret-drop: interrupted\n")
+        self.assertEqual(out, "")
+        self.assertEqual(self.read_record("page")["state"], "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

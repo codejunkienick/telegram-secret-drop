@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -711,6 +712,123 @@ class StoreTest(ServerCase):
         self.assertIn('method="post"', text)
         status, _headers, _data = self.request("GET", "/s/" + token)
         self.assertEqual(status, 200)
+
+
+class HandshakeFileTest(ServerCase):
+    def test_lists_slot_before_first_request(self):
+        self.open_slot("early", "token")
+        proc = self.start_serve()
+        holder = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                holder = socket.create_connection(
+                    ("127.0.0.1", self.port), timeout=5)
+                break
+            except OSError:
+                if proc.poll() is not None:
+                    self.fail("serve exited early")
+                time.sleep(0.05)
+        self.assertIsNotNone(holder)
+        try:
+            found = None
+            end = time.monotonic() + 2.0
+            while time.monotonic() < end:
+                try:
+                    data = json.loads(
+                        (Path(self.slots) / "server.json").read_text())
+                except (FileNotFoundError, ValueError):
+                    time.sleep(0.05)
+                    continue
+                if "early" in data.get("open", []):
+                    found = data
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(found, "server.json never listed early")
+            self.assertEqual(found["pid"], proc.pid)
+        finally:
+            holder.close()
+        cancel = subprocess.run(
+            [sys.executable, "-B", SECRET_DROP, "--settings",
+             self.settings_path, "cancel", "early"],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(self.tmp))
+        self.assertEqual(cancel.returncode, 0)
+        self.assertEqual(proc.wait(timeout=10), 0)
+
+    def test_served_needs_current_slot_id(self):
+        import unittest.mock as mock
+        record, _token = new_slot(self.settings, "page",
+                                  self.target("token"), "", 10,
+                                  False, False)
+        stale = {"pid": os.getpid(), "open": ["page"],
+                 "open_ids": ["00" * 8],
+                 "updated_at": int(time.time())}
+        slots_path = Path(self.slots)
+        slots_path.mkdir(mode=0o700, exist_ok=True)
+        tmp_name = ".server-test.tmp"
+        tmp_path = slots_path / tmp_name
+        tmp_path.write_bytes(json.dumps(stale).encode("utf-8"))
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, slots_path / "server.json")
+        with mock.patch.object(secret_drop, "_start_unit",
+                               return_value=None):
+            served = secret_drop._wait_served(
+                self.settings, "page", time.monotonic() + 0.5,
+                record["slot_id"])
+        self.assertFalse(served)
+
+    def test_denied_peer_is_not_served(self):
+        import unittest.mock as mock
+        record, _token = new_slot(self.settings, "page",
+                                  self.target("token"), "", 10,
+                                  False, False)
+        slots_path = Path(self.slots)
+        slots_path.mkdir(mode=0o700, exist_ok=True)
+        live = {"pid": os.getpid(), "open": ["page"],
+                "open_ids": [record["slot_id"]],
+                "updated_at": int(time.time())}
+        tmp_path = slots_path / ".server-live.tmp"
+        tmp_path.write_bytes(json.dumps(live).encode("utf-8"))
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, slots_path / "server.json")
+        with mock.patch.object(secret_drop.os, "kill",
+                               side_effect=PermissionError(13, "denied")):
+            self.assertFalse(
+                secret_drop._is_served(str(slots_path), "page",
+                                       record["slot_id"]))
+
+    def test_sigterm_exits_zero_and_unlinks(self):
+        self.open_slot("term", "token")
+        proc = self.start_serve()
+        self.wait_serving(proc, "term")
+        proc.terminate()
+        try:
+            code = proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.fail("serve did not exit within 2 s of SIGTERM")
+        self.assertEqual(code, 0)
+        self.assertFalse((Path(self.slots) / "server.json").exists())
+
+    def test_sigterm_during_first_sync_exits_zero(self):
+        import unittest.mock as mock
+        new_slot(self.settings, "early-term", self.target("token"),
+                 "", 10, False, False)
+        real_sync = secret_drop._sync_server_file
+        called = []
+
+        def probe(settings):
+            if not called:
+                called.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_sync(settings)
+
+        with mock.patch.object(secret_drop, "_sync_server_file",
+                               side_effect=probe):
+            code = secret_drop._run_server(self.settings, self.slots)
+        self.assertTrue(called)
+        self.assertEqual(code, 0)
+        self.assertFalse((Path(self.slots) / "server.json").exists())
 
 
 if __name__ == "__main__":

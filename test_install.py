@@ -126,6 +126,7 @@ class InstallCase(unittest.TestCase):
             cwd=str(self.tmp), env=env)
 
     def expected_unit(self, python, script, settings):
+        script_dir = os.path.dirname(os.path.realpath(script))
         lines = [
             UNIT_COMMENT,
             "[Unit]",
@@ -142,8 +143,9 @@ class InstallCase(unittest.TestCase):
             "NoNewPrivileges=true",
             "PrivateTmp=true",
             "ProtectSystem=strict",
-            "ProtectHome=read-only",
-            "ReadWritePaths=%s %s %s" % (
+            "ProtectHome=tmpfs",
+            "BindReadOnlyPaths=%s %s" % (script_dir, settings),
+            "BindPaths=%s %s %s" % (
                 self.slots, self.allowed_one, self.allowed_two),
             "RestrictSUIDSGID=true",
             "LockPersonality=true",
@@ -515,6 +517,63 @@ class InstallCase(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertFalse(Path(self.slots).exists())
         self.assertFalse(self.unit_path().exists())
+
+    def test_render_unit_has_sandbox_binds(self):
+        proc = self.run_render(SECRET_DROP, self.settings_path)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, "")
+        script = os.path.realpath(SECRET_DROP)
+        script_dir = os.path.dirname(script)
+        self.assertIn("ProtectHome=tmpfs\n", proc.stdout)
+        self.assertIn("BindReadOnlyPaths=%s %s\n" % (
+            script_dir, self.settings_path), proc.stdout)
+        self.assertIn("BindPaths=%s %s %s\n" % (
+            self.slots, self.allowed_one, self.allowed_two),
+            proc.stdout)
+        self.assertNotIn("ProtectHome=read-only", proc.stdout)
+        self.assertNotIn("ReadWritePaths=", proc.stdout)
+        self.assertNotIn("@", proc.stdout)
+
+    def test_python_under_home_refused(self):
+        under = self.home / "bin" / "python3"
+        under.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        under.write_bytes(b"#!/bin/sh\nexit 0\n")
+        os.chmod(under, 0o700)
+        self.write_settings(self.tmp / "settings.toml",
+                            python=str(under))
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        for args in (["check"], ["render-unit"]):
+            with self.subTest(args=args):
+                proc = subprocess.run(
+                    [sys.executable, "-B", SECRET_DROP, "--settings",
+                     self.settings_path, *args],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(self.tmp), env=env)
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(proc.stderr,
+                                 "secret-drop: python_under_home\n")
+                self.assertEqual(proc.stdout, "")
+        env = self.make_env()
+        for args in (["--settings", self.settings_path],
+                     ["--settings", self.settings_path, "--dry-run"]):
+            with self.subTest(args=args):
+                before = self.tree_snapshot()
+                proc = self.run_install(env, *args)
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(proc.stderr,
+                                 "secret-drop: python_under_home\n")
+                self.assertEqual(proc.stdout, "")
+                self.assertEqual(self.tree_snapshot(), before)
+
+    def test_system_python_outside_home_passes(self):
+        proc = subprocess.run(
+            [sys.executable, "-B", SECRET_DROP, "--settings",
+             self.settings_path, "check"],
+            capture_output=True, text=True, timeout=60,
+            cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, "")
 
 
 if __name__ == "__main__":

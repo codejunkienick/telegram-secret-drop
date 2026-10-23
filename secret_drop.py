@@ -7,6 +7,7 @@ learns only whether it was stored and its length.
 
 import argparse
 import datetime
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -178,14 +179,14 @@ def _load_allowed_dirs(data):
             found = os.stat(path)
         except OSError:
             raise SettingsError(
-                "settings: allowed_dirs must be existing owner-only"
-                " directories")
+                "settings: allowed_dirs must be existing directories"
+                " you own that group and others cannot write")
         if (not stat.S_ISDIR(found.st_mode)
                 or found.st_uid != os.getuid()
                 or found.st_mode & 0o022):
             raise SettingsError(
-                "settings: allowed_dirs must be existing owner-only"
-                " directories")
+                "settings: allowed_dirs must be existing directories"
+                " you own that group and others cannot write")
         expanded.append(path)
     if len(set(expanded)) != len(expanded):
         raise SettingsError("settings: allowed_dirs must not repeat a directory")
@@ -353,12 +354,100 @@ def check_target(settings, target, overwrite):
         os.close(fd)
 
 
+def _write_temp_bytes(tmp_fd, value):
+    try:
+        os.fchmod(tmp_fd, 0o600)
+        view = memoryview(value)
+        while view:
+            written = os.write(tmp_fd, view)
+            view = view[written:]
+        os.fsync(tmp_fd)
+    except OSError:
+        raise TargetError("parent_changed")
+
+
 def write_secret(settings, target, overwrite, value):
     """Write value bytes to target atomically and owner-only."""
     if not isinstance(value, (bytes, bytearray, memoryview)):
         raise TypeError("value must be bytes")
     allowed, components, name, fd = _open_parent_fd(settings, target, overwrite)
     try:
+        try:
+            found = os.lstat(name, dir_fd=fd)
+        except FileNotFoundError:
+            found = None
+        except OSError:
+            raise TargetError("parent_changed")
+        if found is not None:
+            if stat.S_ISREG(found.st_mode):
+                if not overwrite:
+                    raise TargetError("target_exists")
+            else:
+                raise TargetError("target_not_regular")
+        if overwrite:
+            tmp_name = ".secret-drop-" + secrets.token_hex(8)
+            try:
+                tmp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+            except OSError:
+                raise TargetError("parent_changed")
+            try:
+                try:
+                    _write_temp_bytes(tmp_fd, value)
+                finally:
+                    os.close(tmp_fd)
+                try:
+                    os.replace(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+                except OSError:
+                    raise TargetError("parent_changed")
+                os.fsync(fd)
+            except BaseException as exc:
+                try:
+                    os.unlink(tmp_name, dir_fd=fd)
+                except OSError:
+                    pass
+                if isinstance(exc, OSError):
+                    raise TargetError("parent_changed")
+                raise
+            return len(value)
+        o_tmpfile = getattr(os, "O_TMPFILE", None)
+        tmp_fd = None
+        use_tmpfile = o_tmpfile is not None
+        if use_tmpfile:
+            try:
+                tmp_fd = os.open(".", os.O_WRONLY | o_tmpfile | os.O_CLOEXEC,
+                                 0o600, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
+                    use_tmpfile = False
+                    tmp_fd = None
+                else:
+                    raise TargetError("parent_changed")
+        if use_tmpfile:
+            try:
+                _write_temp_bytes(tmp_fd, value)
+                try:
+                    os.link("/proc/self/fd/%d" % tmp_fd, name,
+                            dst_dir_fd=fd, follow_symlinks=True)
+                except FileExistsError:
+                    try:
+                        current = os.lstat(name, dir_fd=fd)
+                    except FileNotFoundError:
+                        raise TargetError("target_exists")
+                    except OSError:
+                        raise TargetError("parent_changed")
+                    if not stat.S_ISREG(current.st_mode):
+                        raise TargetError("target_not_regular")
+                    raise TargetError("target_exists")
+                except OSError:
+                    raise TargetError("parent_changed")
+                os.fsync(fd)
+            finally:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            return len(value)
         tmp_name = ".secret-drop-" + secrets.token_hex(8)
         try:
             tmp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -367,12 +456,7 @@ def write_secret(settings, target, overwrite, value):
             raise TargetError("parent_changed")
         try:
             try:
-                os.fchmod(tmp_fd, 0o600)
-                view = memoryview(value)
-                while view:
-                    written = os.write(tmp_fd, view)
-                    view = view[written:]
-                os.fsync(tmp_fd)
+                _write_temp_bytes(tmp_fd, value)
             finally:
                 os.close(tmp_fd)
             try:
@@ -383,14 +467,26 @@ def write_secret(settings, target, overwrite, value):
                 raise TargetError("parent_changed")
             if found is not None:
                 if stat.S_ISREG(found.st_mode):
-                    if not overwrite:
-                        raise TargetError("target_exists")
-                else:
-                    raise TargetError("target_not_regular")
+                    raise TargetError("target_exists")
+                raise TargetError("target_not_regular")
             try:
-                os.replace(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+                os.link(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+            except FileExistsError:
+                try:
+                    current = os.lstat(name, dir_fd=fd)
+                except FileNotFoundError:
+                    raise TargetError("target_exists")
+                except OSError:
+                    raise TargetError("parent_changed")
+                if not stat.S_ISREG(current.st_mode):
+                    raise TargetError("target_not_regular")
+                raise TargetError("target_exists")
             except OSError:
                 raise TargetError("parent_changed")
+            try:
+                os.unlink(tmp_name, dir_fd=fd)
+            except OSError:
+                raise TargetError("target_temp_left")
             os.fsync(fd)
         except BaseException as exc:
             try:
@@ -571,7 +667,12 @@ def _read_all(slots_dir):
             continue
         if entry == "server.json":
             continue  # the serve handshake file, not a slot
-        record = _load_record(slots_dir, entry[:-len(".json")])
+        name = entry[:-len(".json")]
+        try:
+            record = _load_record(slots_dir, name)
+        except SlotError:
+            records[name] = {"name": name, "state": "unreadable"}
+            continue
         if record is None:
             continue
         records[record["name"]] = record
@@ -589,6 +690,8 @@ def _expire_sweep(slots_dir, records, now):
 
 def _prune_finished(slots_dir, records, now):
     for record in records.values():
+        if record.get("state") == "unreadable":
+            continue
         if (record["state"] != "open" and record["finished_at"] is not None
                 and now - record["finished_at"] > _PRUNE_AFTER_SECONDS):
             try:
@@ -694,6 +797,8 @@ def finish(settings, name, state, length=None, error=None, now=None):
         record = records.get(name)
         if record is None:
             raise SlotError("no_such_slot")
+        if record.get("state") == "unreadable":
+            raise SlotError("slot_unreadable")
         if record["state"] != "open":
             raise SlotError("slot_not_open")
         record["state"] = state
@@ -734,11 +839,16 @@ def _sync_server_file(settings):
     with _locked_slots(settings) as slots_dir:
         records = _read_all(slots_dir)
         _expire_sweep(slots_dir, records, int(time.time()))
-        names = sorted(name for name, record in records.items()
-                       if record["state"] == "open")
+        open_records = sorted(
+            (record for record in records.values()
+             if record.get("state") == "open"),
+            key=lambda r: r["name"])
+        names = [record["name"] for record in open_records]
         if names:
+            ids = [record["slot_id"] for record in open_records]
             _write_json_atomic(slots_dir, "server.json",
                                {"pid": os.getpid(), "open": names,
+                                "open_ids": ids,
                                 "updated_at": int(time.time())}, "server")
         else:
             try:
@@ -754,7 +864,7 @@ def _local_hhmm(when):
 
 
 def _read_server_handshake(slots_dir):
-    """Return the server.json (pid, open names), or None when absent."""
+    """Return the server.json (pid, open names, open ids), or None absent."""
     try:
         fd = os.open(os.path.join(slots_dir, "server.json"),
                      os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -784,22 +894,30 @@ def _read_server_handshake(slots_dir):
     if (not isinstance(obj, dict) or not isinstance(obj.get("open"), list)
             or type(obj.get("pid")) is not int):
         return None
-    return (obj["pid"], obj["open"])
+    ids = obj.get("open_ids")
+    if ids is not None and (not isinstance(ids, list)
+                            or any(not isinstance(v, str) for v in ids)):
+        return None
+    if ids is None:
+        ids = []
+    return (obj["pid"], obj["open"], ids)
 
 
-def _is_served(slots_dir, name):
+def _is_served(slots_dir, name, slot_id=None):
     found = _read_server_handshake(slots_dir)
     if found is None:
         return False
-    pid, names = found
+    pid, names, ids = found
     if pid <= 0 or name not in names:
+        return False
+    if slot_id is not None and slot_id not in ids:
         return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        return False
     except OSError:
         return False
     return True
@@ -824,19 +942,24 @@ def _start_unit(settings, timeout):
         proc.wait()
 
 
-def _wait_served(settings, name, deadline):
+def _wait_served(settings, name, deadline, slot_id=None):
     """Wait until the serving server lists the slot; False past deadline.
 
     Deadline is an absolute monotonic time owned by the caller; every
     systemctl call runs with at most the time left under it.
     """
     slots_dir = settings.slots_dir
+    if slot_id is None:
+        try:
+            slot_id = _load_record(slots_dir, name)["slot_id"]
+        except (SlotError, TypeError, KeyError):
+            slot_id = None
     last_start = None
     while True:
         now = time.monotonic()
         if now >= deadline:
             return False
-        if _is_served(slots_dir, name):
+        if _is_served(slots_dir, name, slot_id):
             return True
         if last_start is None or now - last_start >= 1.0:
             _start_unit(settings, min(deadline - now, 10.0))
@@ -1159,31 +1282,64 @@ def _run_server(settings, slots_dir):
         except OSError:
             print("secret-drop: already_serving", file=sys.stderr)
             return 0
-        with _locked_slots(settings) as locked:
-            records = _read_all(locked)
-            _expire_sweep(locked, records, int(time.time()))
-            names = sorted(name for name, record in records.items()
-                           if record["state"] == "open")
-        if not names:
+        stopped = False
+
+        def _stop(signum, frame):
+            nonlocal stopped
+            stopped = True
+
+        old_term = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _stop)
+        try:
+            with _locked_slots(settings) as locked:
+                records = _read_all(locked)
+                _expire_sweep(locked, records, int(time.time()))
+                names = sorted(name for name, record in records.items()
+                               if record.get("state") == "open")
+            if not names:
+                try:
+                    os.unlink(os.path.join(slots_dir, "server.json"))
+                except FileNotFoundError:
+                    pass
+                return 0
             try:
-                os.unlink(os.path.join(slots_dir, "server.json"))
-            except FileNotFoundError:
-                pass
-            return 0
-        try:
-            server = _SlotServer(settings)
-        except OSError:
-            print("secret-drop: bind_failed", file=sys.stderr)
-            return 1
-        try:
-            server.timeout = 1.0
-            while True:
-                server.handle_request()
+                server = _SlotServer(settings)
+            except OSError:
+                print("secret-drop: bind_failed", file=sys.stderr)
+                return 1
+            try:
                 if not _sync_server_file(settings):
                     server.server_close()
                     return 0
+                server.timeout = 1.0
+                while True:
+                    if stopped:
+                        try:
+                            os.unlink(
+                                os.path.join(slots_dir, "server.json"))
+                        except FileNotFoundError:
+                            pass
+                        server.server_close()
+                        return 0
+                    server.handle_request()
+                    if stopped:
+                        try:
+                            os.unlink(
+                                os.path.join(slots_dir, "server.json"))
+                        except FileNotFoundError:
+                            pass
+                        server.server_close()
+                        return 0
+                    if not _sync_server_file(settings):
+                        server.server_close()
+                        return 0
+            finally:
+                server.server_close()
         finally:
-            server.server_close()
+            try:
+                signal.signal(signal.SIGTERM, old_term)
+            except OSError:
+                pass
     finally:
         os.close(lock_fd)
 
@@ -1201,11 +1357,31 @@ def _serve_command(args):
         return 1
 
 
+def _is_python_under_home(python_path):
+    real = os.path.realpath(python_path)
+    if real == "/home" or real.startswith("/home/"):
+        return True
+    if real == "/root" or real.startswith("/root/"):
+        return True
+    home = os.environ.get("HOME")
+    if home:
+        try:
+            home_real = os.path.realpath(home)
+        except OSError:
+            home_real = home
+        if real == home_real or real.startswith(home_real + "/"):
+            return True
+    return False
+
+
 def _check_command(args):
     try:
         settings = load_settings(args.settings)
     except SettingsError as exc:
         print("secret-drop: %s" % exc, file=sys.stderr)
+        return 1
+    if _is_python_under_home(settings.python):
+        print("secret-drop: python_under_home", file=sys.stderr)
         return 1
     sys.stdout.write("settings ok\nunit=%s\nslots_dir=%s\npython=%s\n"
                      % (settings.unit, settings.slots_dir, settings.python))
@@ -1213,7 +1389,8 @@ def _check_command(args):
 
 
 _TEMPLATE_FILE = "secret-drop.service.in"
-_TEMPLATE_NAMES = ("PYTHON", "SCRIPT", "SETTINGS", "SLOTS_DIR", "ALLOWED_DIRS")
+_TEMPLATE_NAMES = ("PYTHON", "SCRIPT", "SCRIPT_DIR", "SETTINGS",
+                   "SLOTS_DIR", "ALLOWED_DIRS")
 
 
 def _read_template_text():
@@ -1242,12 +1419,17 @@ def _render_unit_command(args):
     except SettingsError as exc:
         print("secret-drop: %s" % exc, file=sys.stderr)
         return 1
+    if _is_python_under_home(settings.python):
+        print("secret-drop: python_under_home", file=sys.stderr)
+        return 1
+    script_real = os.path.realpath(__file__)
     values = {"PYTHON": settings.python,
-              "SCRIPT": os.path.realpath(__file__),
+              "SCRIPT": script_real,
+              "SCRIPT_DIR": os.path.dirname(script_real),
               "SETTINGS": settings.settings_path,
               "SLOTS_DIR": settings.slots_dir,
               "ALLOWED_DIRS": " ".join(settings.allowed_dirs)}
-    for key in ("SCRIPT", "SETTINGS"):
+    for key in ("SCRIPT", "SCRIPT_DIR", "SETTINGS"):
         if not _PATH_RE.fullmatch(values[key]):
             print("secret-drop: unsafe_path", file=sys.stderr)
             return 1
@@ -1434,7 +1616,8 @@ def _open_command(args):
                              args.ttl_minutes, args.overwrite, args.replace)
     deadline = time.monotonic() + 5.0
     try:
-        if not _wait_served(settings, record["name"], deadline):
+        if not _wait_served(settings, record["name"], deadline,
+                             record["slot_id"]):
             _cancel_quietly(settings, record["name"])
             print("secret-drop: server_not_running", file=sys.stderr)
             return 1
@@ -1455,6 +1638,10 @@ def _open_command(args):
         return 0
     except (SettingsError, TargetError, SlotError):
         raise
+    except KeyboardInterrupt:
+        _cancel_quietly(settings, record["name"])
+        print("secret-drop: interrupted", file=sys.stderr)
+        return 130
     except Exception:
         _cancel_quietly(settings, record["name"])
         print("secret-drop: send_failed (exit error)", file=sys.stderr)
@@ -1469,6 +1656,8 @@ def _read_status_record(args):
         record = records.get(args.name)
         if record is None:
             raise SlotError("no_such_slot")
+        if record.get("state") == "unreadable":
+            raise SlotError("slot_unreadable")
         return record
 
 
@@ -1503,11 +1692,15 @@ def _list_command(args):
     with _locked_slots(settings) as slots_dir:
         records = _read_all(slots_dir)
         _expire_sweep(slots_dir, records, int(time.time()))
-        shown = [{"name": record["name"],
-                  "state": record["state"],
-                  "expires_at": _iso(record["expires_at"])}
-                 for record in sorted(records.values(),
-                                      key=lambda r: r["name"])]
+        shown = []
+        for record in sorted(records.values(), key=lambda r: r["name"]):
+            if record.get("state") == "unreadable":
+                shown.append({"name": record["name"],
+                              "state": "unreadable"})
+            else:
+                shown.append({"name": record["name"],
+                              "state": record["state"],
+                              "expires_at": _iso(record["expires_at"])})
     sys.stdout.write(json.dumps(shown, sort_keys=True) + "\n")
     return 0
 

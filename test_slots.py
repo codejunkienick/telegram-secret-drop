@@ -539,12 +539,19 @@ class SubcommandTest(SlotCase):
     def test_fifo_record_never_blocks(self):
         settings = load_settings(self.settings_path)
         new_slot(settings, "ok", self.target("f-ok"), "", 10,
-                 False, False, now=NOW)
+                 False, False)
         os.mkfifo(os.path.join(self.slots, "stuck.json"))
         proc = self.run_cli("list", timeout=10)
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
+        self.assertEqual(proc.returncode, 0)
+        shown = json.loads(proc.stdout)
+        by_name = {item["name"]: item for item in shown}
+        self.assertEqual(set(by_name), {"ok", "stuck"})
+        self.assertEqual(by_name["stuck"]["state"], "unreadable")
+        self.assertEqual(set(by_name["stuck"]), {"name", "state"})
         proc = self.run_cli("status", "ok", timeout=10)
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(json.loads(proc.stdout)["state"], "open")
+        proc = self.run_cli("status", "stuck", timeout=10)
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
 
@@ -559,8 +566,9 @@ class SubcommandTest(SlotCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
         proc = self.run_cli("list")
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
+        self.assertEqual(proc.returncode, 0)
+        shown = json.loads(proc.stdout)
+        self.assertEqual(shown, [{"name": "beta", "state": "unreadable"}])
 
     def test_epoch_out_of_range_refused(self):
         for stamp in (10 ** 25, -(10 ** 25)):
@@ -659,6 +667,35 @@ class SubcommandTest(SlotCase):
         self.assertEqual(proc.returncode, 0)
         shown = json.loads(proc.stdout)
         self.assertEqual([item["name"] for item in shown], ["real"])
+
+    def test_corrupt_beside_good_lists_both(self):
+        settings = load_settings(self.settings_path)
+        new_slot(settings, "good", self.target("f-good"), "", 10,
+                 False, False)
+        self.record_file("bad").write_bytes(b"not json{{{")
+        self.assertTrue(self.record_file("bad").exists())
+        proc = self.run_cli("list")
+        self.assertEqual(proc.returncode, 0)
+        shown = json.loads(proc.stdout)
+        by_name = {item["name"]: item for item in shown}
+        self.assertEqual(set(by_name), {"good", "bad"})
+        self.assertEqual(by_name["bad"], {"name": "bad",
+                                          "state": "unreadable"})
+        self.assertEqual(by_name["good"]["state"], "open")
+        proc = self.run_cli("status", "good")
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(json.loads(proc.stdout)["state"], "open")
+        new_slot(settings, "third", self.target("f-third"), "", 10,
+                 False, False)
+        self.assertTrue(self.record_file("third").exists())
+        self.assertTrue(self.record_file("bad").exists())
+        proc = self.run_cli("status", "bad")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
+        self.assertEqual(proc.stdout, "")
+        proc = self.run_cli("cancel", "bad")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stderr, "secret-drop: slot_unreadable\n")
 
 
 if __name__ == "__main__":

@@ -68,6 +68,25 @@ if ! "$python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11)
   exit 1
 fi
 
+# The server could not see an interpreter under a home directory, so such
+# a python is refused with the same line the check command prints.
+real_python=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$python" 2>/dev/null || printf '%s' "$python")
+case "$real_python" in
+  /home|/home/*|/root|/root/*)
+    echo "secret-drop: python_under_home" >&2
+    exit 1
+    ;;
+esac
+if [ -n "${HOME:-}" ]; then
+  home_real=$(python3 -c 'import os; print(os.path.realpath(os.environ.get("HOME", "/nonexistent")))' 2>/dev/null || printf '%s' "$HOME")
+  case "$real_python" in
+    "$home_real"|"$home_real"/*)
+      echo "secret-drop: python_under_home" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 unit_path="$unit_dir/$unit"
 
